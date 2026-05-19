@@ -119,6 +119,8 @@ Examples:
   %(prog)s --import backup.cswap
   %(prog)s --tui                              # interactive arrow-key menu
   %(prog)s --upgrade                          # self-upgrade to latest version
+  %(prog)s --watch                            # auto-switch at 90%% usage
+  %(prog)s --watch 80                         # auto-switch at 80%% usage
         """,
     )
 
@@ -246,6 +248,14 @@ Examples:
             "Pass '-' to read from stdin or omit the value to be prompted securely."
         ),
     )
+    group.add_argument(
+        "--watch",
+        metavar="THRESHOLD",
+        nargs="?",
+        const=90.0,
+        type=float,
+        help="Monitor usage and auto-switch when THRESHOLD%% is reached (default: 90)",
+    )
 
     args = parser.parse_args()
 
@@ -334,6 +344,8 @@ Examples:
                 )
                 sys.exit(1)
             sys.exit(tui_run(switcher))
+        elif args.watch is not None:
+            switcher.watch(threshold=args.watch)
     except ClaudeSwitchError as e:
         error(f"Error: {e}")
         sys.exit(1)
@@ -345,7 +357,7 @@ Examples:
     # don't immediately recreate <backup_root>/cache/update_check.json inside
     # the directory we just deleted. Skipped after --upgrade as a safety guard
     # in case the dispatch is later refactored to fall through.
-    if not args.purge and not args.upgrade:
+    if not args.purge and not args.upgrade and args.watch is None:
         from claude_swap.update_check import check_for_update
 
         msg = check_for_update(__version__)

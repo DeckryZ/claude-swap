@@ -65,6 +65,7 @@ def _main_loop(stdscr: "curses._CursesWindow", switcher: ClaudeAccountSwitcher) 
             ("Remove account", "remove"),
             ("Refresh credentials (current login, in-place)", "refresh"),
             ("List accounts (with usage)", "list"),
+            ("Watch usage & auto-switch (Ctrl+C to stop)", "watch"),
             ("Status", "status"),
             ("Quit", "quit"),
         ]
@@ -88,6 +89,8 @@ def _main_loop(stdscr: "curses._CursesWindow", switcher: ClaudeAccountSwitcher) 
                 _do_refresh(stdscr, switcher)
             elif choice == "list":
                 _shell_out(stdscr, lambda: switcher.list_accounts())
+            elif choice == "watch":
+                _shell_out(stdscr, lambda: switcher.watch())
             elif choice == "status":
                 _shell_out(stdscr, switcher.status)
         except ClaudeSwitchError as e:

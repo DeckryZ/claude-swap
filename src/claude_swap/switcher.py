@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import logging
 import os
 import re
 import shutil
+import socket
+import struct
+import subprocess
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -758,6 +763,140 @@ class ClaudeAccountSwitcher:
         if updated:
             data["lastUpdated"] = get_timestamp()
             self._write_json(self.sequence_file, data)
+
+    @staticmethod
+    def _ws_send_interrupt(port: int, auth_token: str) -> bool:
+        """Connect to a Claude Code IDE WebSocket and send an interrupt frame.
+
+        Uses a hand-rolled WebSocket handshake so no extra dependencies are needed.
+        Returns True if the interrupt was delivered, False on any error (silent fail).
+        """
+        try:
+            key = base64.b64encode(os.urandom(16)).decode()
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(3)
+            sock.connect(("127.0.0.1", port))
+
+            request = (
+                f"GET / HTTP/1.1\r\n"
+                f"Host: 127.0.0.1:{port}\r\n"
+                f"Upgrade: websocket\r\n"
+                f"Connection: Upgrade\r\n"
+                f"Sec-WebSocket-Key: {key}\r\n"
+                f"Sec-WebSocket-Version: 13\r\n"
+                f"x-claude-code-ide-authorization: {auth_token}\r\n"
+                f"\r\n"
+            )
+            sock.sendall(request.encode())
+
+            response = b""
+            while b"\r\n\r\n" not in response:
+                chunk = sock.recv(1024)
+                if not chunk:
+                    break
+                response += chunk
+
+            if b"101 Switching Protocols" not in response:
+                sock.close()
+                return False
+
+            payload = json.dumps({"type": "interrupt"}).encode()
+            mask = os.urandom(4)
+            masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+            length = len(payload)
+            if length < 126:
+                header = struct.pack("!BB", 0x81, 0x80 | length) + mask
+            else:
+                header = struct.pack("!BBH", 0x81, 0xFE, length) + mask
+            sock.sendall(header + masked)
+
+            close_mask = os.urandom(4)
+            sock.sendall(struct.pack("!BB", 0x88, 0x80) + close_mask)
+            sock.close()
+            return True
+        except Exception:
+            return False
+
+    def _notify_ide_instances(self) -> int:
+        """Send an interrupt to all running VS Code IDE instances via WebSocket.
+
+        Returns the count of instances that were successfully interrupted.
+        """
+        try:
+            _, ide_instances = get_running_instances()
+        except Exception:
+            return 0
+
+        if not ide_instances:
+            return 0
+
+        ide_dir = get_claude_config_home() / "ide"
+        interrupted = 0
+        for instance in ide_instances:
+            try:
+                lockfile = ide_dir / f"{instance.port}.lock"
+                data = json.loads(lockfile.read_text(encoding="utf-8"))
+                auth_token = data.get("authToken", "")
+                if auth_token and self._ws_send_interrupt(instance.port, auth_token):
+                    interrupted += 1
+            except Exception:
+                pass
+        return interrupted
+
+    def watch(self, threshold: float = 90.0, interval: int = 60) -> None:
+        """Monitor the active account's 5-hour usage and auto-switch when threshold is reached."""
+        print(
+            f"Watching usage — will auto-switch at {threshold:.0f}% "
+            f"(polling every {interval}s). Ctrl+C to stop."
+        )
+        print()
+        last_switched_from: str | None = None
+
+        while True:
+            try:
+                identity = self._get_current_account()
+                if identity is None:
+                    print(dimmed("  No active account.") + "    ", end="\r")
+                else:
+                    current_email, _ = identity
+                    creds = self._read_credentials()
+                    if creds:
+                        usage = oauth.fetch_usage_for_account(
+                            "active", current_email, creds, is_active=True
+                        )
+                        if usage:
+                            h5 = usage.get("five_hour") or {}
+                            pct = h5.get("pct", 0)
+                            countdown = h5.get("countdown", "")
+                            suffix = f"  resets in {countdown}" if countdown else ""
+                            print(
+                                f"  [{current_email}] 5h: {pct:.0f}%{suffix}    ",
+                                end="\r",
+                            )
+                            if pct >= threshold and last_switched_from != current_email:
+                                print(
+                                    f"\n{accent('Usage at')} {pct:.0f}% "
+                                    f"— auto-switching account..."
+                                )
+                                try:
+                                    last_switched_from = current_email
+                                    self.switch()
+                                except Exception as e:
+                                    self._logger.warning(f"Auto-switch failed: {e!r}")
+                                    print(dimmed(f"  Auto-switch failed: {e}"))
+                        else:
+                            print(dimmed("  Usage unavailable.") + "    ", end="\r")
+            except KeyboardInterrupt:
+                print(f"\n{dimmed('Watch stopped.')}")
+                return
+            except Exception as e:
+                self._logger.debug(f"Watch loop error: {e!r}")
+
+            try:
+                time.sleep(interval)
+            except KeyboardInterrupt:
+                print(f"\n{dimmed('Watch stopped.')}")
+                return
 
     def add_account(self, slot: int | None = None) -> None:
         """Add current account to managed accounts.
@@ -1846,7 +1985,14 @@ class ClaudeAccountSwitcher:
                     f"{accent('Activated')} Account-{target_account} ({target_email})"
                 )
                 print()
-                self._print_switch_followup()
+                interrupted = self._notify_ide_instances()
+                if interrupted:
+                    print(dimmed(
+                        f"Interrupted {interrupted} VS Code session(s) — "
+                        f"start a new chat to use the new account."
+                    ))
+                else:
+                    self._print_switch_followup()
                 print()
                 return
 
@@ -1953,7 +2099,14 @@ class ClaudeAccountSwitcher:
             self._logger.warning(f"Post-switch usage display failed: {e!r}")
             print(dimmed("  (usage display unavailable — run `cswap --list` to retry)"))
         print()
-        self._print_switch_followup()
+        interrupted = self._notify_ide_instances()
+        if interrupted:
+            print(dimmed(
+                f"Interrupted {interrupted} VS Code session(s) — "
+                f"start a new chat to use the new account."
+            ))
+        else:
+            self._print_switch_followup()
         print()
 
     def _print_switch_followup(self) -> None:
