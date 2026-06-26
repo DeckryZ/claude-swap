@@ -141,16 +141,12 @@ def keychain_service_name(session_dir: Path) -> str:
 
 
 def _keychain_account_name() -> str:
-    """Keychain account name, mirroring Claude's ``getUsername()``."""
-    user = os.environ.get("USER")
-    if user:
-        return user
-    try:
-        import pwd  # POSIX-only; matches the macOS-only call sites
+    """Keychain account name, mirroring Claude's ``getUsername()``.
 
-        return pwd.getpwuid(os.geteuid()).pw_name
-    except Exception:
-        return "claude-code-user"
+    Delegates to :func:`macos_keychain.keychain_account_name` so session profiles
+    and the active store derive the account name identically.
+    """
+    return macos_keychain.keychain_account_name()
 
 
 def delete_macos_keychain_entry(session_dir: Path) -> None:
@@ -203,6 +199,9 @@ class SessionManager:
             )
 
         account_num, email, org_uuid = self.switcher.resolve_account(identifier)
+        # Guard before the same-account direct-launch fast path below (which
+        # _exec's claude and never returns) — and before setup_session.
+        self._ensure_not_api_key(account_num, email)
 
         config_dir_preset = os.environ.get("CLAUDE_CONFIG_DIR")
         if config_dir_preset:
@@ -265,11 +264,27 @@ class SessionManager:
         os.execvpe(claude_bin, argv, env)
         raise AssertionError("unreachable")  # pragma: no cover
 
+    def _ensure_not_api_key(self, account_num: str, email: str) -> None:
+        """Reject API-key accounts in session mode (not supported yet).
+
+        Session bootstrap is OAuth-shaped — it seeds ``.credentials.json`` and
+        ``_is_session_valid`` requires ``authMethod == "claude.ai"`` — so an API-key
+        account would otherwise fail validation opaquely. Raise early with guidance.
+        """
+        if self.switcher._account_kind(account_num) == "api_key":
+            raise SessionError(
+                f"Account-{account_num} ({email}) is an API-key account; "
+                "'cswap run' (session mode) does not support API-key accounts yet. "
+                "Use 'cswap --switch-to' to make it your default login instead."
+            )
+
     # -- bootstrap -------------------------------------------------------
 
     def setup_session(self, identifier: str, share: bool) -> tuple[Path, str, str]:
         """Ensure a valid session profile exists; returns (dir, num, email)."""
         account_num, email, org_uuid = self.switcher.resolve_account(identifier)
+        # Defense-in-depth: also guard here (run() guards before its fast path).
+        self._ensure_not_api_key(account_num, email)
         session_dir = session_dir_for(self.switcher.backup_dir, account_num, email)
 
         # Deferred invalidation: backup credentials changed while this profile

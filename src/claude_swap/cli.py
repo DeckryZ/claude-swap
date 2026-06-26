@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 
 from claude_swap import __version__
 from claude_swap.exceptions import ClaudeSwitchError
+from claude_swap.json_output import error_envelope
 from claude_swap.printer import dimmed, error, muted
 from claude_swap.switcher import ClaudeAccountSwitcher
 
@@ -100,7 +102,8 @@ def main() -> None:
         epilog="""
 Examples:
   %(prog)s --add-account
-  %(prog)s --add-token sk-ant-oat01-...
+  %(prog)s --add-token sk-ant-oat01-...           # OAuth setup-token
+  %(prog)s --add-token sk-ant-api03-...           # managed API key
   %(prog)s --add-token sk-ant-oat01-... --slot 3
   %(prog)s --add-token sk-ant-oat01-... --email me@example.com
   %(prog)s --add-token - --slot 3
@@ -141,6 +144,14 @@ Examples:
         help="Show OAuth token expiry state (use with --list)",
     )
     parser.add_argument(
+        "--json",
+        action="store_true",
+        help=(
+            "Emit machine-readable JSON to stdout (use with --list, --status, "
+            "--switch, or --switch-to). See README 'JSON output for scripting'."
+        ),
+    )
+    parser.add_argument(
         "--strategy",
         choices=["best", "next-available"],
         metavar="{best,next-available}",
@@ -161,7 +172,8 @@ Examples:
         metavar="EMAIL",
         help=(
             "Email address for the account. Optional with --add-token; "
-            "defaults to setup-token-{slot}@token.local since setup-tokens "
+            "defaults to setup-token-{slot}@token.local (or "
+            "api-key-{slot}@token.local for API keys) since these tokens "
             "carry no real email metadata."
         ),
     )
@@ -244,8 +256,9 @@ Examples:
         nargs="?",
         const="",
         help=(
-            "Register a raw OAuth setup-token as a new account. "
-            "Pass '-' to read from stdin or omit the value to be prompted securely."
+            "Register a raw OAuth setup-token or managed API key (sk-ant-api...) "
+            "as a new account; the type is auto-detected. Pass '-' to read from "
+            "stdin or omit the value to be prompted securely."
         ),
     )
     group.add_argument(
@@ -261,6 +274,16 @@ Examples:
 
     if args.token_status and not args.list:
         parser.error("--token-status can only be used with --list")
+
+    if args.json and not (args.list or args.status or args.switch or args.switch_to):
+        parser.error(
+            "--json can only be used with --list, --status, --switch, or --switch-to"
+        )
+
+    if args.json and args.token_status:
+        # Token status is not part of the JSON v1 schema; reject rather than
+        # silently ignore it (a future additive field can add it).
+        parser.error("--token-status cannot be combined with --json")
 
     if args.strategy is not None and not args.switch:
         parser.error("--strategy can only be used with --switch")
@@ -295,6 +318,9 @@ Examples:
     # init-time failures (e.g. MigrationError on a backup-dir collision)
     # are presented like every other ClaudeSwitchError: clean stderr line,
     # exit 1, no traceback.
+    # JSON-capable commands return a payload; the CLI is the single point that
+    # serializes it (so no command writes JSON to stdout itself).
+    payload: dict | None = None
     try:
         switcher = ClaudeAccountSwitcher(debug=args.debug)
 
@@ -315,15 +341,16 @@ Examples:
         elif args.remove_account:
             switcher.remove_account(args.remove_account)
         elif args.list:
-            switcher.list_accounts(
+            payload = switcher.list_accounts(
                 show_token_status=args.token_status,
+                json_output=args.json,
             )
         elif args.switch:
-            switcher.switch(strategy=args.strategy)
+            payload = switcher.switch(strategy=args.strategy, json_output=args.json)
         elif args.switch_to:
-            switcher.switch_to(args.switch_to)
+            payload = switcher.switch_to(args.switch_to, json_output=args.json)
         elif args.status:
-            switcher.status()
+            payload = switcher.status(json_output=args.json)
         elif args.purge:
             switcher.purge()
         elif args.export:
@@ -347,17 +374,30 @@ Examples:
         elif args.watch is not None:
             switcher.watch(threshold=args.watch)
     except ClaudeSwitchError as e:
-        error(f"Error: {e}")
+        # In JSON mode keep stdout pure JSON: emit the structured error envelope
+        # there (exit 1) instead of a red stderr line.
+        if args.json:
+            print(json.dumps(error_envelope(e), indent=2))
+        else:
+            error(f"Error: {e}")
         sys.exit(1)
     except KeyboardInterrupt:
-        print(f"\n{dimmed('Operation cancelled')}")
+        # Route the cancellation note to stderr in JSON mode so stdout stays
+        # parseable (the guarantee covers completion / handled errors, not Ctrl-C).
+        print(
+            f"\n{dimmed('Operation cancelled')}",
+            file=sys.stderr if args.json else sys.stdout,
+        )
         sys.exit(130)
+
+    if args.json and payload is not None:
+        print(json.dumps(payload, indent=2))
 
     # Passive update notification (never fails). Skipped after --purge so we
     # don't immediately recreate <backup_root>/cache/update_check.json inside
     # the directory we just deleted. Skipped after --upgrade as a safety guard
     # in case the dispatch is later refactored to fall through.
-    if not args.purge and not args.upgrade and args.watch is None:
+    if not args.purge and not args.upgrade and args.watch is None and not args.json:
         from claude_swap.update_check import check_for_update
 
         msg = check_for_update(__version__)
